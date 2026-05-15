@@ -1,6 +1,6 @@
 module github.com/froh/thermres
 
-go 1.26
+go 1.26.3
 
 require (
 	github.com/blacktop/go-termimg v0.1.26 // indirect

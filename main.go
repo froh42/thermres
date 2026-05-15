@@ -68,11 +68,15 @@ func main() {
 
 	// If the intel-rapl directory exists but we couldn't open any
 	// energy_uj files, it means we're not running setuid-root.
+	self, _ := os.Executable()
+	if self == "" {
+		self = "thermres"
+	}
 	if len(raplDomains) == 0 {
 		if _, err := os.Stat(raplBase); err == nil && syscall.Geteuid() != 0 {
 			log.Fatalf("FATAL RAPL files at %s are root-only but we are not setuid-root.\n"+
 				"       Install with:\n"+
-				"       sudo chown root thermres && sudo chmod u+s thermres", raplBase)
+				"       sudo chown root %s && sudo chmod u+s %s", raplBase, self, self)
 		}
 	}
 
