@@ -171,7 +171,7 @@ func querySamples(db *sql.DB, tag *string, since, until *time.Time) []point {
 		args = append(args, float64(until.UnixMilli())/1000.0)
 	}
 	q := fmt.Sprintf(
-		"SELECT pkg_temp_c, power_w FROM samples WHERE %s ORDER BY ts",
+		"SELECT ts, pkg_temp_c, power_w FROM samples WHERE %s ORDER BY ts",
 		strings.Join(clauses, " AND "),
 	)
 	rows, err := db.Query(q, args...)
@@ -183,13 +183,24 @@ func querySamples(db *sql.DB, tag *string, since, until *time.Time) []point {
 	var pts []point
 	for rows.Next() {
 		var p point
-		if err := rows.Scan(&p.Temp, &p.Power); err != nil {
+		if err := rows.Scan(&p.TS, &p.Temp, &p.Power); err != nil {
 			log.Printf("scan: %v", err)
 			continue
 		}
 		pts = append(pts, p)
 	}
-	return pts
+
+	// Discard any point whose gap from the raw predecessor exceeds 10 s
+	// (suspend/resume artifact — the first sample after resume has a
+	// bogus power_w computed from the suspend-accumulated energy delta).
+	const maxGap = 10.0
+	filtered := pts[:0]
+	for i, p := range pts {
+		if i == 0 || p.TS-pts[i-1].TS <= maxGap {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
 }
 
 func applyTimeBin(pts []point, timeBin string) []point {

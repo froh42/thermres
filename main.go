@@ -50,6 +50,8 @@ func main() {
 		"Log each sample to stderr")
 	tag := flag.String("tag", "",
 		"Optional tag written into every row (e.g. 'pre-repaste')")
+	maxGap := flag.Float64("max-gap", 60,
+		"Skip samples whose gap from previous exceeds this many seconds (avoids suspend artifacts)")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime)
@@ -118,12 +120,23 @@ func main() {
 		log.Fatalf("FATAL database: %v", err)
 	}
 	defer db.Close()
+	defer insertEvent(db, "shutdown", "thermres stopped")
+
+	tagStr := *tag
+	if tagStr == "" {
+		tagStr = "(none)"
+	}
+	insertEvent(db, "startup", fmt.Sprintf(
+		"thermres started — interval=%.1fs, max-gap=%.0fs, tag=%s",
+		*interval, *maxGap, tagStr,
+	))
 
 	// ── Restore previous state ────────────────────────────────────
 	// Read the last row so the first power_w computation doesn't
 	// produce a spike from the idle gap.
 	var prevTS float64
 	var prevPkgEnergy, prevPsysEnergy, prevDramEnergy *int64
+	first := true
 
 	last, err := getLastSample(db)
 	if err != nil {
@@ -190,6 +203,8 @@ func main() {
 		platformProfile: platformProfile,
 		verbose:         *verbose,
 		tag:             tagVal,
+		maxGap:          *maxGap,
+		first:           &first,
 	})
 
 	for ctx.Err() == nil {
@@ -209,6 +224,8 @@ func main() {
 				platformProfile: platformProfile,
 				verbose:         *verbose,
 				tag:             tagVal,
+				maxGap:          *maxGap,
+				first:           &first,
 			})
 		}
 	}
@@ -237,6 +254,8 @@ type SampleArgs struct {
 	platformProfile *string
 	verbose         bool
 	tag             *string
+	maxGap          float64
+	first           *bool
 }
 
 // sampleAndLog reads all sensors, computes power, writes to DB,
@@ -286,23 +305,36 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 		)
 	}
 
-	// ── DB insert ─────────────────────────────────────────────────
-	sample := &Sample{
-		TS:              ts,
-		PkgTempC:        pkgTempC,
-		CoreTemps:       coreTemps,
-		PkgEnergy:       pkgEnergy,
-		PsysEnergy:      psysEnergy,
-		DramEnergy:      dramEnergy,
-		FreqMHz:         freqMHz,
-		Governor:        governor,
-		PlatformProfile: a.platformProfile,
-		PowerW:          powerW,
-		Tag:             a.tag,
+	// ── Gap check (suspend/resume guard) ──────────────────────────
+	// If the gap from the previous sample exceeds maxGap seconds,
+	// skip the DB insert but still update prev pointers so the next
+	// tick computes power correctly.
+	// The first sample (fresh start or resume from DB) is always kept.
+	tsGap := ts - *a.prevTS
+	gapTooLarge := !*a.first && *a.prevPkgEnergy != nil && tsGap > a.maxGap
+	*a.first = false
+
+	if gapTooLarge {
+		insertEvent(db, "gap_skip", fmt.Sprintf("ts_gap=%.1fs — possible sleep", tsGap))
 	}
 
-	if err := insertSample(db, sample); err != nil {
-		log.Printf("ERROR insert: %v", err)
+	if !gapTooLarge {
+		sample := &Sample{
+			TS:              ts,
+			PkgTempC:        pkgTempC,
+			CoreTemps:       coreTemps,
+			PkgEnergy:       pkgEnergy,
+			PsysEnergy:      psysEnergy,
+			DramEnergy:      dramEnergy,
+			FreqMHz:         freqMHz,
+			Governor:        governor,
+			PlatformProfile: a.platformProfile,
+			PowerW:          powerW,
+			Tag:             a.tag,
+		}
+		if err := insertSample(db, sample); err != nil {
+			log.Printf("ERROR insert: %v", err)
+		}
 	}
 
 	// ── Update previous values ────────────────────────────────────
@@ -330,6 +362,9 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 			valOrElse(a.platformProfile, "?"),
 			coreStr,
 		)
+		if gapTooLarge {
+			log.Printf("INFO gap_skip event logged to db")
+		}
 	}
 }
 

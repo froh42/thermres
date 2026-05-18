@@ -15,11 +15,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite" // driver registration (init() runs, registers "sqlite")
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Schema DDL — same layout as the Python version.
 const createTablesSQL = `
@@ -44,6 +45,15 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 
 CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts);
+
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          REAL    NOT NULL,
+    event_type  TEXT    NOT NULL,
+    message     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 `
 
 // Sample holds one tick of sensor readings before DB insertion.
@@ -119,6 +129,7 @@ func ensureSchema(db *sql.DB) error {
 
 		// v1 → v2: add tag column for --tag filtering.
 		mustExecWhen(db, currentVer, 1, "ALTER TABLE samples ADD COLUMN tag TEXT")
+		// v2 → v3: events table (handled by CREATE TABLE IF NOT EXISTS in DDL).
 
 		if _, err := db.Exec(
 			"INSERT INTO schema_version (version) VALUES (?)",
@@ -202,6 +213,17 @@ func countSamples(db *sql.DB) (int, error) {
 	var n int
 	err := db.QueryRow("SELECT COUNT(*) FROM samples").Scan(&n)
 	return n, err
+}
+
+// insertEvent writes a row into the events table.
+func insertEvent(db *sql.DB, eventType, message string) {
+	ts := float64(time.Now().UnixNano()) / 1e9
+	if _, err := db.Exec(
+		"INSERT INTO events (ts, event_type, message) VALUES (?, ?, ?)",
+		ts, eventType, message,
+	); err != nil {
+		log.Printf("ERROR insert event: %v", err)
+	}
 }
 
 // defaultDBPath returns ~/.local/share/thermres/thermres.db.
