@@ -1,2 +1,4 @@
-thermres-plot
-thermres
+/thermres-plot
+/thermres
+/.idea
+*.db

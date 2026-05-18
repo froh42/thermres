@@ -135,6 +135,7 @@ func main() {
 	// Read the last row so the first power_w computation doesn't
 	// produce a spike from the idle gap.
 	var prevTS float64
+	var prevTime *time.Time
 	var prevPkgEnergy, prevPsysEnergy, prevDramEnergy *int64
 	first := true
 
@@ -197,6 +198,7 @@ func main() {
 		psysDom:         psysDom,
 		dramDom:         dramDom,
 		prevTS:          &prevTS,
+		prevTime:        &prevTime,
 		prevPkgEnergy:   &prevPkgEnergy,
 		prevPsysEnergy:  &prevPsysEnergy,
 		prevDramEnergy:  &prevDramEnergy,
@@ -218,6 +220,7 @@ func main() {
 				psysDom:         psysDom,
 				dramDom:         dramDom,
 				prevTS:          &prevTS,
+				prevTime:        &prevTime,
 				prevPkgEnergy:   &prevPkgEnergy,
 				prevPsysEnergy:  &prevPsysEnergy,
 				prevDramEnergy:  &prevDramEnergy,
@@ -248,6 +251,7 @@ type SampleArgs struct {
 	psysDom         *RaplDomain
 	dramDom         *RaplDomain
 	prevTS          *float64
+	prevTime        **time.Time // monotonic+wall clock snapshot of previous tick
 	prevPkgEnergy   **int64
 	prevPsysEnergy  **int64
 	prevDramEnergy  **int64
@@ -261,7 +265,25 @@ type SampleArgs struct {
 // sampleAndLog reads all sensors, computes power, writes to DB,
 // updates prev* pointers, and optionally prints to stderr.
 func sampleAndLog(db *sql.DB, a *SampleArgs) {
-	ts := float64(time.Now().UnixNano()) / 1e9
+	curr := time.Now()
+	ts := float64(curr.UnixNano()) / 1e9
+
+	// ── Suspend detection via monotonic vs wall-clock comparison ──
+	// CLOCK_MONOTONIC (used by Go's Sub) freezes during suspend.
+	// Wall clock (UnixNano) keeps advancing.  A significant difference
+	// between the two deltas means the system was suspended mid-interval.
+	//
+	// Threshold: 200 ms covers normal scheduler jitter but catches even
+	// very brief suspends (screen-off, s2idle).
+	const suspendThresholdMs = 200
+	var suspendedMs int64
+	if *a.prevTime != nil {
+		prev := *a.prevTime
+		wallDeltaNs := curr.UnixNano() - prev.UnixNano()
+		monoDeltaNs := int64(curr.Sub(*prev))
+		suspendedMs = (wallDeltaNs - monoDeltaNs) / 1_000_000
+	}
+	suspended := suspendedMs >= suspendThresholdMs
 
 	// ── Temperature ───────────────────────────────────────────────
 	var pkgTempC *float64
@@ -271,24 +293,30 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 	}
 
 	// ── RAPL energy ──────────────────────────────────────────────
+	// rawPkg/Psys/Dram hold the actual counter values for prev* updates.
+	// pkgEnergy etc. may be set to nil for non-normal sample types.
 	var pkgEnergy, psysEnergy, dramEnergy *int64
+	var rawPkgEnergy, rawPsysEnergy, rawDramEnergy *int64
 
 	if a.pkgDom != nil {
 		v, ok := a.pkgDom.ReadEnergy()
 		if ok {
 			pkgEnergy = &v
+			rawPkgEnergy = pkgEnergy
 		}
 	}
 	if a.psysDom != nil {
 		v, ok := a.psysDom.ReadEnergy()
 		if ok {
 			psysEnergy = &v
+			rawPsysEnergy = psysEnergy
 		}
 	}
 	if a.dramDom != nil {
 		v, ok := a.dramDom.ReadEnergy()
 		if ok {
 			dramEnergy = &v
+			rawDramEnergy = dramEnergy
 		}
 	}
 
@@ -296,8 +324,11 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 	freqMHz, governor := readFreqAndGovernor()
 
 	// ── Power computation ─────────────────────────────────────────
+	// Skip if suspended: the RAPL counter resets on resume, so the
+	// delta would be garbage (either huge from wrap-correction, or
+	// near-zero from a reset before the interval elapsed).
 	var powerW *float64
-	if pkgEnergy != nil && a.pkgDom != nil {
+	if !suspended && pkgEnergy != nil && a.pkgDom != nil {
 		powerW = computePower(
 			*a.prevPkgEnergy, pkgEnergy,
 			a.pkgDom.MaxEnergy,
@@ -305,43 +336,61 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 		)
 	}
 
-	// ── Gap check (suspend/resume guard) ──────────────────────────
-	// If the gap from the previous sample exceeds maxGap seconds,
-	// skip the DB insert but still update prev pointers so the next
-	// tick computes power correctly.
-	// The first sample (fresh start or resume from DB) is always kept.
+	// ── Determine sample type ─────────────────────────────────────
+	// "startup" : first sample after process start (power delta is unreliable)
+	// "suspend" : monotonic/wall-clock divergence detected (short gap)
+	// "gap_skip": wall-clock gap > maxGap (long suspend or process restart)
+	// "normal"  : everything nominal
 	tsGap := ts - *a.prevTS
-	gapTooLarge := !*a.first && *a.prevPkgEnergy != nil && tsGap > a.maxGap
+	isFirst := *a.first
+	gapTooLarge := !isFirst && *a.prevPkgEnergy != nil && tsGap > a.maxGap
 	*a.first = false
 
-	if gapTooLarge {
-		insertEvent(db, "gap_skip", fmt.Sprintf("ts_gap=%.1fs — possible sleep", tsGap))
+	sampleType := "normal"
+	switch {
+	case isFirst:
+		sampleType = "startup"
+	case gapTooLarge:
+		sampleType = "gap_skip"
+	case suspended:
+		sampleType = "suspend"
 	}
 
-	if !gapTooLarge {
-		sample := &Sample{
-			TS:              ts,
-			PkgTempC:        pkgTempC,
-			CoreTemps:       coreTemps,
-			PkgEnergy:       pkgEnergy,
-			PsysEnergy:      psysEnergy,
-			DramEnergy:      dramEnergy,
-			FreqMHz:         freqMHz,
-			Governor:        governor,
-			PlatformProfile: a.platformProfile,
-			PowerW:          powerW,
-			Tag:             a.tag,
-		}
-		if err := insertSample(db, sample); err != nil {
-			log.Printf("ERROR insert: %v", err)
-		}
+	// Energy values are unreliable/misleading for non-normal samples:
+	// on suspend the RAPL counter resets, on gap_skip the baseline is stale.
+	// Store NULL so analyses don't accidentally use them as deltas.
+	if sampleType != "normal" {
+		pkgEnergy = nil
+		psysEnergy = nil
+		dramEnergy = nil
+	}
+
+	sample := &Sample{
+		TS:              ts,
+		SampleType:      sampleType,
+		PkgTempC:        pkgTempC,
+		CoreTemps:       coreTemps,
+		PkgEnergy:       pkgEnergy,
+		PsysEnergy:      psysEnergy,
+		DramEnergy:      dramEnergy,
+		FreqMHz:         freqMHz,
+		Governor:        governor,
+		PlatformProfile: a.platformProfile,
+		PowerW:          powerW,
+		Tag:             a.tag,
+	}
+	if err := insertSample(db, sample); err != nil {
+		log.Printf("ERROR insert: %v", err)
 	}
 
 	// ── Update previous values ────────────────────────────────────
+	// Always use the raw (pre-null) energy readings as baseline for
+	// the next tick's delta computation.
 	*a.prevTS = ts
-	*a.prevPkgEnergy = pkgEnergy
-	*a.prevPsysEnergy = psysEnergy
-	*a.prevDramEnergy = dramEnergy
+	*a.prevTime = &curr
+	*a.prevPkgEnergy = rawPkgEnergy
+	*a.prevPsysEnergy = rawPsysEnergy
+	*a.prevDramEnergy = rawDramEnergy
 
 	// ── Verbose output ────────────────────────────────────────────
 	if a.verbose {
@@ -354,7 +403,8 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 			coreStr = strings.Join(parts, ",")
 		}
 
-		log.Printf("INFO pkg=%.1f°C  power=%.2fW  freq=%.0fMHz  gov=%s  profile=%s  cores=[%s]",
+		log.Printf("INFO [%s] pkg=%.1f°C  power=%.2fW  freq=%.0fMHz  gov=%s  profile=%s  cores=[%s]",
+			sampleType,
 			valOrZero(pkgTempC),
 			valOrZero(powerW),
 			valOrZero(freqMHz),
@@ -362,8 +412,11 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 			valOrElse(a.platformProfile, "?"),
 			coreStr,
 		)
+		if suspended {
+			log.Printf("INFO suspend_detected ≈%dms — power_w/energy set to NULL", suspendedMs)
+		}
 		if gapTooLarge {
-			log.Printf("INFO gap_skip event logged to db")
+			log.Printf("INFO gap_skip ts_gap=%.1fs", tsGap)
 		}
 	}
 }

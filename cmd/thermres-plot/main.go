@@ -156,7 +156,7 @@ func defaultDBPath() string {
 }
 
 func querySamples(db *sql.DB, tag *string, since, until *time.Time) []point {
-	clauses := []string{"power_w IS NOT NULL", "pkg_temp_c IS NOT NULL"}
+	clauses := []string{"sample_type = 'normal'", "power_w IS NOT NULL", "pkg_temp_c IS NOT NULL"}
 	args := []interface{}{}
 	if tag != nil {
 		clauses = append(clauses, "tag = ?")

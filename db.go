@@ -20,7 +20,7 @@ import (
 	_ "modernc.org/sqlite" // driver registration (init() runs, registers "sqlite")
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Schema DDL — same layout as the Python version.
 const createTablesSQL = `
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS samples (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     ts               REAL    NOT NULL,
+    sample_type      TEXT    NOT NULL DEFAULT 'normal',
     pkg_temp_c       REAL,
     core_temps       TEXT,
     pkg_energy       INTEGER,
@@ -60,6 +61,7 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 // Pointer fields (*float64 etc.) mean "nullable" — nil maps to SQL NULL.
 type Sample struct {
 	TS              float64
+	SampleType      string // "normal", "suspend", "gap_skip"
 	PkgTempC        *float64
 	CoreTemps       []float64
 	PkgEnergy       *int64
@@ -130,6 +132,11 @@ func ensureSchema(db *sql.DB) error {
 		// v1 → v2: add tag column for --tag filtering.
 		mustExecWhen(db, currentVer, 1, "ALTER TABLE samples ADD COLUMN tag TEXT")
 		// v2 → v3: events table (handled by CREATE TABLE IF NOT EXISTS in DDL).
+		// v3 → v4: add sample_type column.
+		if currentVer < 4 {
+			mustExecWhen(db, currentVer, currentVer,
+				"ALTER TABLE samples ADD COLUMN sample_type TEXT NOT NULL DEFAULT 'normal'")
+		}
 
 		if _, err := db.Exec(
 			"INSERT INTO schema_version (version) VALUES (?)",
@@ -160,10 +167,11 @@ func insertSample(db *sql.DB, s *Sample) error {
 
 	_, err := db.Exec(
 		`INSERT INTO samples
-		 (ts, pkg_temp_c, core_temps, pkg_energy, psys_energy, dram_energy,
+		 (ts, sample_type, pkg_temp_c, core_temps, pkg_energy, psys_energy, dram_energy,
 		  freq_mhz, governor, platform_profile, power_w, tag)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.TS,
+		s.SampleType,
 		s.PkgTempC,
 		coreJSON,
 		s.PkgEnergy,
