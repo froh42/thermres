@@ -20,7 +20,7 @@ import (
 	_ "modernc.org/sqlite" // driver registration (init() runs, registers "sqlite")
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // Schema DDL — same layout as the Python version.
 const createTablesSQL = `
@@ -136,6 +136,40 @@ func ensureSchema(db *sql.DB) error {
 		if currentVer < 4 {
 			mustExecWhen(db, currentVer, currentVer,
 				"ALTER TABLE samples ADD COLUMN sample_type TEXT NOT NULL DEFAULT 'normal'")
+		}
+		// v4 → v5: retroactively mark anomaly rows in old data.
+		// Pass 1: rows where the gap from the previous row exceeds 1.5 s are
+		//         boundary rows — the RAPL delta is over a huge time span and
+		//         the resulting power_w is garbage.
+		// Pass 2: the row immediately after a boundary often has a sub-second
+		//         gap (thermres fires a tick then the ticker fires quickly) and
+		//         its delta is computed from the reset-baseline, also bogus.
+		// Only update rows still marked 'normal' so we don't overwrite the
+		// typed rows written by the newer code.
+		if currentVer < 5 {
+			mustExecWhen(db, currentVer, currentVer, `
+				UPDATE samples SET sample_type = 'anomaly'
+				WHERE sample_type = 'normal'
+				  AND id IN (
+				    SELECT id FROM (
+				      SELECT id,
+				             ts - LAG(ts) OVER (ORDER BY id) AS gap
+				      FROM samples
+				    ) WHERE gap > 1.5 OR gap IS NULL
+				  )`)
+			// Pass 2 runs after pass 1 so the updated sample_type values
+			// are visible for the LAG() lookup.
+			mustExecWhen(db, currentVer, currentVer, `
+				UPDATE samples SET sample_type = 'anomaly'
+				WHERE sample_type = 'normal'
+				  AND id IN (
+				    SELECT id FROM (
+				      SELECT id,
+				             LAG(sample_type) OVER (ORDER BY id) AS prev_type,
+				             ts - LAG(ts) OVER (ORDER BY id)     AS gap
+				      FROM samples
+				    ) WHERE prev_type = 'anomaly' AND gap < 1.5
+				  )`)
 		}
 
 		if _, err := db.Exec(

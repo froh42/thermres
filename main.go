@@ -356,13 +356,14 @@ func sampleAndLog(db *sql.DB, a *SampleArgs) {
 		sampleType = "suspend"
 	}
 
-	// Energy values are unreliable/misleading for non-normal samples:
-	// on suspend the RAPL counter resets, on gap_skip the baseline is stale.
-	// Store NULL so analyses don't accidentally use them as deltas.
+	// Energy and power values are unreliable/misleading for non-normal
+	// samples: on suspend the RAPL counter resets, on startup/gap_skip the
+	// baseline is stale.  Null them out so analyses don't use them.
 	if sampleType != "normal" {
 		pkgEnergy = nil
 		psysEnergy = nil
 		dramEnergy = nil
+		powerW = nil
 	}
 
 	sample := &Sample{

@@ -33,6 +33,12 @@ func main() {
 		"Aggregate over time windows (e.g. '5m', '1h')")
 	powerBin := flag.Float64("power-bin", 0,
 		"Aggregate into N-watt power buckets")
+	warmup := flag.Float64("warmup", 30,
+		"Exclude samples within this many seconds after any non-normal event (startup/suspend/gap)")
+	rolling := flag.Float64("rolling", 0,
+		"Rolling average window in seconds; filters thermal mass transients (e.g. 300)")
+	thermalResistance := flag.Bool("thermal-resistance", false,
+		"Print thermal resistance (°C/W) and R², then exit without rendering a chart")
 	output := flag.String("output", "",
 		"Save PNG to file instead of terminal display")
 	flag.Parse()
@@ -77,10 +83,29 @@ func main() {
 	var seriesList []chartdraw.Series
 	colorIdx := 0
 
+	// processPts applies the rolling average (if requested) and optionally
+	// prints the thermal resistance, returning the processed points.
+	processPts := func(pts []point, label string) []point {
+		if *rolling > 0 {
+			before := len(pts)
+			pts = applyRollingAvg(pts, *rolling)
+			log.Printf("INFO %s: rolling avg %.0fs: %d → %d points", label, *rolling, before, len(pts))
+		}
+		if *thermalResistance && len(pts) >= 2 {
+			slope, _, r2 := linearRegression(pts)
+			log.Printf("Thermal resistance (%s): %.3f °C/W  (R²: %.3f)", label, slope, r2)
+		}
+		return pts
+	}
+
 	if len(tags) == 0 {
-		pts := querySamples(db, nil, sinceTime, untilTime)
+		pts := querySamples(db, nil, sinceTime, untilTime, *warmup)
 		if len(pts) == 0 {
 			log.Fatalf("no samples found")
+		}
+		pts = processPts(pts, "all")
+		if *thermalResistance {
+			return
 		}
 		pts = applyTimeBin(pts, *timeBin)
 		series := buildSeries(pts, *powerBin, "all", colorIdx)
@@ -90,13 +115,20 @@ func main() {
 		}
 	} else {
 		for _, t := range tags {
-			pts := querySamples(db, &t, sinceTime, untilTime)
+			pts := querySamples(db, &t, sinceTime, untilTime, *warmup)
+			pts = processPts(pts, t)
+			if *thermalResistance {
+				continue
+			}
 			pts = applyTimeBin(pts, *timeBin)
 			series := buildSeries(pts, *powerBin, t, colorIdx)
 			if series != nil {
 				seriesList = append(seriesList, series)
 				colorIdx++
 			}
+		}
+		if *thermalResistance {
+			return
 		}
 	}
 
@@ -155,23 +187,39 @@ func defaultDBPath() string {
 	return filepath.Join(home, ".local", "share", "thermres", "thermres.db")
 }
 
-func querySamples(db *sql.DB, tag *string, since, until *time.Time) []point {
-	clauses := []string{"sample_type = 'normal'", "power_w IS NOT NULL", "pkg_temp_c IS NOT NULL"}
+func querySamples(db *sql.DB, tag *string, since, until *time.Time, warmupSecs float64) []point {
+	clauses := []string{
+		"s.sample_type = 'normal'",
+		"s.power_w IS NOT NULL",
+		"s.pkg_temp_c IS NOT NULL",
+	}
+	// Exclude rows that fall within warmupSecs after any non-normal event.
+	// There are very few non-normal rows so the NOT EXISTS correlated
+	// subquery is fast regardless of table size.
+	if warmupSecs > 0 {
+		clauses = append(clauses, fmt.Sprintf(
+			`NOT EXISTS (
+			   SELECT 1 FROM samples anom
+			   WHERE anom.sample_type != 'normal'
+			     AND anom.ts >= s.ts - %.1f
+			     AND anom.ts < s.ts
+			 )`, warmupSecs))
+	}
 	args := []interface{}{}
 	if tag != nil {
-		clauses = append(clauses, "tag = ?")
+		clauses = append(clauses, "s.tag = ?")
 		args = append(args, *tag)
 	}
 	if since != nil {
-		clauses = append(clauses, "ts >= ?")
+		clauses = append(clauses, "s.ts >= ?")
 		args = append(args, float64(since.UnixMilli())/1000.0)
 	}
 	if until != nil {
-		clauses = append(clauses, "ts <= ?")
+		clauses = append(clauses, "s.ts <= ?")
 		args = append(args, float64(until.UnixMilli())/1000.0)
 	}
 	q := fmt.Sprintf(
-		"SELECT ts, pkg_temp_c, power_w FROM samples WHERE %s ORDER BY ts",
+		"SELECT s.ts, s.pkg_temp_c, s.power_w FROM samples s WHERE %s ORDER BY s.ts",
 		strings.Join(clauses, " AND "),
 	)
 	rows, err := db.Query(q, args...)
@@ -251,6 +299,105 @@ func applyTimeBin(pts []point, timeBin string) []point {
 	return out
 }
 
+// applyRollingAvg replaces each point with the mean of (power, temp) over the
+// preceding windowSecs seconds. Points where the window contains any sub-gap
+// larger than maxSubGap are discarded — those windows straddle a resume/restart
+// boundary and the average would mix cold-start and equilibrium data.
+func applyRollingAvg(pts []point, windowSecs float64) []point {
+	const maxSubGap = 2.0 // seconds; gaps larger than this invalidate a window
+	if windowSecs <= 0 || len(pts) == 0 {
+		return pts
+	}
+
+	out := make([]point, 0, len(pts))
+	for i, p := range pts {
+		// Walk backwards collecting all points in [p.TS - windowSecs, p.TS].
+		var sumP, sumT float64
+		n := 0
+		valid := true
+		for j := i; j >= 0; j-- {
+			if p.TS-pts[j].TS > windowSecs {
+				break
+			}
+			// Check for sub-gap between consecutive points inside the window.
+			// Also catches the gap between the oldest in-window point and
+			// the point just before it (which would fall outside the window
+			// boundary, meaning there's a hole at the window edge).
+			if j < i && pts[j+1].TS-pts[j].TS > maxSubGap {
+				valid = false
+				break
+			}
+			// If this is the oldest point in the window and it isn't the
+			// very first sample, check the gap to the point before it.
+			// If that gap is large, the window doesn't have continuous
+			// coverage back to windowSecs ago — discard.
+			if j > 0 && p.TS-pts[j].TS < windowSecs && pts[j].TS-pts[j-1].TS > maxSubGap {
+				// The window nominally covers [p.TS-windowSecs, p.TS] but
+				// the data only goes back to pts[j].TS continuously.
+				// Only accept if the continuous coverage is "full enough".
+				// We require the window to be filled from at least (p.TS - windowSecs).
+				if p.TS-pts[j].TS < windowSecs*0.9 {
+					valid = false
+				}
+				break
+			}
+			sumP += pts[j].Power
+			sumT += pts[j].Temp
+			n++
+		}
+		if !valid || n == 0 {
+			continue
+		}
+		out = append(out, point{
+			TS:    p.TS,
+			Power: sumP / float64(n),
+			Temp:  sumT / float64(n),
+		})
+	}
+	return out
+}
+
+// linearRegression fits T = intercept + slope*P via OLS.
+// Returns slope (°C/W = thermal resistance), intercept, and R².
+// Returns zeros if fewer than 2 points.
+func linearRegression(pts []point) (slope, intercept, r2 float64) {
+	n := float64(len(pts))
+	if n < 2 {
+		return 0, 0, 0
+	}
+
+	var sumP, sumT, sumPP, sumPT float64
+	for _, p := range pts {
+		sumP += p.Power
+		sumT += p.Temp
+		sumPP += p.Power * p.Power
+		sumPT += p.Power * p.Temp
+	}
+	meanP := sumP / n
+	meanT := sumT / n
+
+	ssPT := sumPT - n*meanP*meanT
+	ssPP := sumPP - n*meanP*meanP
+	if ssPP == 0 {
+		return 0, meanT, 0
+	}
+
+	slope = ssPT / ssPP
+	intercept = meanT - slope*meanP
+
+	// R²: 1 - SS_res / SS_tot
+	var ssRes, ssTot float64
+	for _, p := range pts {
+		predicted := intercept + slope*p.Power
+		ssRes += (p.Temp - predicted) * (p.Temp - predicted)
+		ssTot += (p.Temp - meanT) * (p.Temp - meanT)
+	}
+	if ssTot > 0 {
+		r2 = 1 - ssRes/ssTot
+	}
+	return slope, intercept, r2
+}
+
 func buildSeries(pts []point, powerBin float64, name string, colorIdx int) chartdraw.Series {
 	if len(pts) == 0 {
 		return nil
@@ -295,7 +442,9 @@ func buildBinnedLine(pts []point, binSize float64, name string, colorIdx int) ch
 	keys := []int64{}
 
 	for _, p := range pts {
-		k := int64(math.Floor(p.Power/binSize)) * int64(binSize)
+		// Use integer bin index as map key to avoid float precision issues.
+		// k=0 → [0, binSize), k=1 → [binSize, 2*binSize), etc.
+		k := int64(math.Floor(p.Power / binSize))
 		b, ok := m[k]
 		if !ok {
 			b = &bucket{}
@@ -313,7 +462,12 @@ func buildBinnedLine(pts []point, binSize float64, name string, colorIdx int) ch
 	for _, k := range keys {
 		b := m[k]
 		xv = append(xv, b.sumTemp/float64(b.count))
-		yv = append(yv, float64(k)+binSize/2)
+		yv = append(yv, (float64(k)+0.5)*binSize) // bin centre
+	}
+
+	if len(xv) < 2 {
+		log.Printf("WARN %s: only %d power bin(s) — try a larger --power-bin", name, len(xv))
+		return nil
 	}
 
 	c := chartdraw.GetDefaultColor(colorIdx)
