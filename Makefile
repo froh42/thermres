@@ -3,12 +3,15 @@ BINDIR = $(HOME)/.local/bin
 UNIT_DIR = $(HOME)/.config/systemd/user
 UNIT = thermres.service
 
+SRCS = $(wildcard *.go)
+PLOT_SRCS = $(wildcard cmd/thermres-plot/*.go)
+
 all: $(BINS)
 
-thermres:
+thermres: $(SRCS)
 	CGO_ENABLED=0 go build -o $@ .
 
-thermres-plot:
+thermres-plot: $(PLOT_SRCS)
 	CGO_ENABLED=0 go build -o $@ ./cmd/thermres-plot
 
 install: all
