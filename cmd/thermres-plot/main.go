@@ -33,12 +33,14 @@ func main() {
 		"Aggregate over time windows (e.g. '5m', '1h')")
 	powerBin := flag.Float64("power-bin", 0,
 		"Aggregate into N-watt power buckets")
-	warmup := flag.Float64("warmup", 30,
+	warmup := flag.Float64("warmup", 300,
 		"Exclude samples within this many seconds after any non-normal event (startup/suspend/gap)")
 	rolling := flag.Float64("rolling", 0,
 		"Rolling average window in seconds; filters thermal mass transients (e.g. 300)")
 	thermalResistance := flag.Bool("thermal-resistance", false,
 		"Print thermal resistance (°C/W) and R², then exit without rendering a chart")
+	dailyResistance := flag.Bool("daily-resistance", false,
+		"Plot daily thermal resistance (°C/W) over time (your ADHD coping tool)")
 	output := flag.String("output", "",
 		"Save PNG to file instead of terminal display")
 	flag.Parse()
@@ -78,6 +80,85 @@ func main() {
 				tags = append(tags, t)
 			}
 		}
+	}
+
+	// Daily thermal resistance mode: completely separate chart.
+	if *dailyResistance {
+		var seriesList []chartdraw.Series
+		var dayTicks []chartdraw.Tick
+		colorIdx := 0
+		tags := tags
+		if len(tags) == 0 {
+			tags = []string{""}
+		}
+		for _, t := range tags {
+			var tp *string
+			if t != "" {
+				tp = &t
+			}
+			pts := querySamples(db, tp, sinceTime, untilTime, *warmup)
+			label := t
+			if label == "" {
+				label = "all"
+			}
+			rth, count, ticks := buildDailyResistanceSeries(pts, label, colorIdx)
+			if rth != nil {
+				seriesList = append(seriesList, rth, count)
+				// Use the ticks from the first series; they share the same x positions.
+				if dayTicks == nil {
+					dayTicks = ticks
+				}
+				colorIdx++
+			}
+		}
+		if len(seriesList) == 0 {
+			log.Fatalf("no daily data to plot")
+		}
+		graph := chartdraw.Chart{
+			Title:  "Daily Thermal Resistance",
+			Width:  800,
+			Height: 500,
+			XAxis: chartdraw.XAxis{
+				Name:  "Date",
+				Ticks: dayTicks,
+				Style: chartdraw.Style{
+					TextRotationDegrees: 45,
+				},
+			},
+			YAxis: chartdraw.YAxis{
+				Name: "Thermal Resistance (°C/W)",
+			},
+			YAxisSecondary: chartdraw.YAxis{
+				Name: "Samples per day",
+			},
+			Background: chartdraw.Style{Padding: chartdraw.NewBox(20, 30, 20, 30)},
+			Series:     seriesList,
+		}
+		buf, err := renderChart(&graph)
+		if err != nil {
+			log.Fatalf("render chart: %v", err)
+		}
+		if *output != "" {
+			if err := os.WriteFile(*output, buf, 0644); err != nil {
+				log.Fatalf("write output: %v", err)
+			}
+			log.Printf("saved to %s", *output)
+		} else {
+			tmp := filepath.Join(os.TempDir(), "thermres-plot-"+fmt.Sprint(time.Now().UnixNano())+".png")
+			if err := os.WriteFile(tmp, buf, 0644); err != nil {
+				log.Fatalf("write temp: %v", err)
+			}
+			defer os.Remove(tmp)
+			termimg.PrintFile(tmp)
+		}
+		return
+	}
+
+	// When rolling average is requested without an explicit power-bin, default
+	// to a 1W bin so the output is a clean line rather than 100k+ scatter dots.
+	if *rolling > 0 && *powerBin == 0 && !*thermalResistance {
+		*powerBin = 1.0
+		log.Printf("INFO --rolling without --power-bin: defaulting to --power-bin 1")
 	}
 
 	var seriesList []chartdraw.Series
@@ -482,6 +563,93 @@ func buildBinnedLine(pts []point, binSize float64, name string, colorIdx int) ch
 			DotWidth:    4,
 		},
 	}
+}
+
+// buildDailyResistanceSeries groups pts by local calendar day, applies a
+// rolling average within each day to filter thermal mass transients, runs OLS
+// regression, and returns two series: R_th on the primary Y axis and sample
+// count on the secondary Y axis.
+// Days with fewer than 120 samples after smoothing or negative R² are skipped.
+const dailyRollingWindow = 2400.0
+
+func buildDailyResistanceSeries(pts []point, name string, colorIdx int) (rthSeries, countSeries chartdraw.Series, ticks []chartdraw.Tick) {
+	if len(pts) == 0 {
+		return nil, nil, nil
+	}
+
+	byDay := make(map[string][]point)
+	dayOrder := []string{}
+	for _, p := range pts {
+		day := time.Unix(int64(p.TS), 0).Local().Format("2006-01-02")
+		if _, seen := byDay[day]; !seen {
+			dayOrder = append(dayOrder, day)
+		}
+		byDay[day] = append(byDay[day], p)
+	}
+
+	xv := []float64{}
+	yv := []float64{}
+	cv := []float64{} // sample counts (secondary axis)
+	for _, day := range dayOrder {
+		dayPts := applyRollingAvg(byDay[day], dailyRollingWindow)
+		if len(dayPts) < 120 {
+			log.Printf("INFO daily-resistance: %s skipped (%d samples after rolling avg)", day, len(dayPts))
+			continue
+		}
+		slope, _, r2 := linearRegression(dayPts)
+		if r2 < 0 {
+			log.Printf("INFO daily-resistance: %s skipped (R²=%.3f)", day, r2)
+			continue
+		}
+		t, _ := time.ParseInLocation("2006-01-02", day, time.Local)
+		log.Printf("INFO daily-resistance: %s  R_th=%.3f °C/W  R²=%.3f  n=%d", day, slope, r2, len(dayPts))
+		xv = append(xv, float64(t.Unix()))
+		yv = append(yv, slope)
+		cv = append(cv, float64(len(dayPts)))
+	}
+
+	if len(xv) < 2 {
+		log.Printf("WARN daily-resistance %s: only %d day(s) with enough data", name, len(xv))
+		return nil, nil, nil
+	}
+
+	// Build explicit ticks at exact midnight for each included day so the
+	// chart renderer places labels precisely on the data points.
+	for _, x := range xv {
+		ts := int64(x)
+		label := time.Unix(ts, 0).Local().Format("2006-01-02")
+		ticks = append(ticks, chartdraw.Tick{Value: x, Label: label})
+	}
+
+	c := chartdraw.GetDefaultColor(colorIdx)
+	rthSeries = chartdraw.ContinuousSeries{
+		Name:    name + " R_th",
+		XValues: xv,
+		YValues: yv,
+		Style: chartdraw.Style{
+			StrokeColor: c,
+			StrokeWidth: 2,
+			DotColor:    c,
+			DotWidth:    5,
+		},
+	}
+
+	// Sample count on secondary axis, dimmed so it doesn't dominate visually.
+	countColor := chartdraw.ColorAlternateGray
+	countSeries = chartdraw.ContinuousSeries{
+		Name:    name + " samples",
+		XValues: xv,
+		YValues: cv,
+		YAxis:   chartdraw.YAxisSecondary,
+		Style: chartdraw.Style{
+			StrokeColor: countColor,
+			StrokeWidth: 1,
+			StrokeDashArray: []float64{4, 4},
+			DotColor:    countColor,
+			DotWidth:    3,
+		},
+	}
+	return rthSeries, countSeries, ticks
 }
 
 func renderChart(graph *chartdraw.Chart) ([]byte, error) {

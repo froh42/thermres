@@ -1,0 +1,13 @@
+[Unit]
+Description=CPU thermal resistance logger
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/thermres
+Restart=on-failure
+RestartSec=5s
+# thermres drops privileges after opening RAPL files; the setuid bit on the
+# binary is what grants the initial root access.
+
+[Install]
+WantedBy=default.target

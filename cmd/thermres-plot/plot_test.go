@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-analyze/charts/chartdraw"
 	_ "modernc.org/sqlite"
@@ -141,7 +142,38 @@ func TestThermalResistance_LiveDB(t *testing.T) {
 
 // ── regression: small power bins still render ─────────────────────
 
-// TestRenderChart_SmallPowerBins is a regression test for the bug where
+// TestDailyResistanceSeries_XValues prints the X timestamps produced by
+// buildDailyResistanceSeries so we can verify they sit correctly on the
+// calendar day boundaries.
+func TestDailyResistanceSeries_XValues(t *testing.T) {
+	db, err := sql.Open("sqlite", liveDB(t))
+	if err != nil {
+		t.Fatal("open db:", err)
+	}
+	defer db.Close()
+
+	pts := querySamples(db, nil, nil, nil, 300.0)
+	if len(pts) < 120 {
+		t.Skipf("only %d samples, need at least 120", len(pts))
+	}
+
+	rth, count, _ := buildDailyResistanceSeries(pts, "all", 0)
+	if rth == nil {
+		t.Fatal("buildDailyResistanceSeries returned nil (not enough days?)")
+	}
+
+	rthCS := rth.(chartdraw.ContinuousSeries)
+	countCS := count.(chartdraw.ContinuousSeries)
+
+	for i, x := range rthCS.XValues {
+		ts := int64(x)
+		day := time.Unix(ts, 0).Local().Format("2006-01-02 15:04:05")
+		midnight := time.Unix(ts, 0).Local().Truncate(24 * time.Hour)
+		offsetH := time.Unix(ts, 0).Local().Sub(midnight).Hours()
+		t.Logf("day %-2d  %s  x=%d  R_th=%.3f  n=%.0f  offset_from_midnight=%.1fh",
+			i, day, ts, rthCS.YValues[i], countCS.YValues[i], offsetH)
+	}
+}
 // --power-bin < 1.0 caused int64(binSize)==0, mapping every point to key 0
 // and producing a single-bucket chart the renderer rejected with:
 // "zero x-range delta; there needs to be at least (2) values"
