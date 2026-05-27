@@ -41,7 +41,7 @@ func main() {
 		"Print thermal resistance (°C/W) and R², then exit without rendering a chart")
 	dailyResistance := flag.Bool("daily-resistance", false,
 		"Plot daily thermal resistance (°C/W) over time (your ADHD coping tool)")
-	minSamples := flag.Int("min-samples", 25000,
+	minSamples := flag.Int("min-samples", 10000,
 		"Minimum raw samples per day to include in the R_th line (--daily-resistance)")
 	output := flag.String("output", "",
 		"Save PNG to file instead of terminal display")
@@ -128,10 +128,12 @@ func main() {
 				},
 			},
 			YAxis: chartdraw.YAxis{
-				Name: "Thermal Resistance (°C/W)",
+				Name:  "Thermal Resistance (°C/W)",
+				Range: &chartdraw.ContinuousRange{Min: 0},
 			},
 			YAxisSecondary: chartdraw.YAxis{
-				Name: "Samples per day",
+				Name:  "Samples per day",
+				Range: &chartdraw.ContinuousRange{Min: 0},
 			},
 			Background: chartdraw.Style{Padding: chartdraw.NewBox(20, 30, 20, 30)},
 			Series:     seriesList,
