@@ -292,49 +292,51 @@ func defaultDBPath() string {
 }
 
 func querySamples(db *sql.DB, tag *string, since, until *time.Time, warmupSecs float64) []point {
-	// Build exclusion ranges from every non-normal event (startup, suspend,
-	// anomaly, gap_skip, …).  The CTE materialises once (~handful of rows)
-	// so the NOT EXISTS subquery scans only those rows instead of the full
-	// samples table, which was the dominant cost (~94% of runtime).
-	cte := ""
-	warmupClause := ""
-	if warmupSecs > 0 {
-		cte = fmt.Sprintf(
-			`WITH exclusion_ranges AS MATERIALIZED (
-			   SELECT ts AS range_start, ts + %.1f AS range_end
-			   FROM samples
-			   WHERE sample_type IN ('startup', 'suspend', 'anomaly', 'gap_skip')
-			 )
-			 `, warmupSecs)
-		warmupClause = `AND NOT EXISTS (
-			   SELECT 1 FROM exclusion_ranges er
-			   WHERE s.ts >= er.range_start AND s.ts < er.range_end
-			 )`
-	}
+	// Static query with named parameters — no dynamic SQL construction.
+	//
+	// The CTE materialises once (~handful of rows) so the NOT EXISTS subquery
+	// scans only those rows instead of the full samples table (~94% speedup).
+	// When :warmup is 0 the CTE produces no rows and NOT EXISTS is always true.
+	//
+	// Optional filters use ":x IS NULL OR ..." so unused params can be nil.
+	const q = `
+		WITH exclusion_ranges AS MATERIALIZED (
+		  SELECT ts AS range_start, ts + :warmup AS range_end
+		  FROM samples
+		  WHERE sample_type IN ('startup', 'suspend', 'anomaly', 'gap_skip')
+		    AND :warmup > 0
+		)
+		SELECT s.ts, s.pkg_temp_c, s.power_w
+		FROM samples s
+		WHERE s.sample_type = 'normal'
+		  AND s.power_w IS NOT NULL
+		  AND s.pkg_temp_c IS NOT NULL
+		  AND (:tag   IS NULL OR s.tag  = :tag)
+		  AND (:since IS NULL OR s.ts  >= :since)
+		  AND (:until IS NULL OR s.ts  <= :until)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM exclusion_ranges er
+		      WHERE s.ts >= er.range_start AND s.ts < er.range_end
+		  )
+		ORDER BY s.ts`
 
-	clauses := []string{
-		"s.sample_type = 'normal'",
-		"s.power_w IS NOT NULL",
-		"s.pkg_temp_c IS NOT NULL",
-	}
-	args := []interface{}{}
+	var tagVal, sinceVal, untilVal interface{}
 	if tag != nil {
-		clauses = append(clauses, "s.tag = ?")
-		args = append(args, *tag)
+		tagVal = *tag
 	}
 	if since != nil {
-		clauses = append(clauses, "s.ts >= ?")
-		args = append(args, float64(since.UnixMilli())/1000.0)
+		sinceVal = float64(since.UnixMilli()) / 1000.0
 	}
 	if until != nil {
-		clauses = append(clauses, "s.ts <= ?")
-		args = append(args, float64(until.UnixMilli())/1000.0)
+		untilVal = float64(until.UnixMilli()) / 1000.0
 	}
-	q := fmt.Sprintf(
-		"%sSELECT s.ts, s.pkg_temp_c, s.power_w FROM samples s WHERE %s %s ORDER BY s.ts",
-		cte, strings.Join(clauses, " AND "), warmupClause,
+
+	rows, err := db.Query(q,
+		sql.Named("warmup", warmupSecs),
+		sql.Named("tag", tagVal),
+		sql.Named("since", sinceVal),
+		sql.Named("until", untilVal),
 	)
-	rows, err := db.Query(q, args...)
 	if err != nil {
 		log.Fatalf("query: %v", err)
 	}
