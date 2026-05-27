@@ -157,7 +157,7 @@ func TestDailyResistanceSeries_XValues(t *testing.T) {
 		t.Skipf("only %d samples, need at least 120", len(pts))
 	}
 
-	rth, count, _ := buildDailyResistanceSeries(pts, "all", 0)
+	rth, count, _ := buildDailyResistanceSeries(pts, "all", 0, 0)
 	if rth == nil {
 		t.Fatal("buildDailyResistanceSeries returned nil (not enough days?)")
 	}

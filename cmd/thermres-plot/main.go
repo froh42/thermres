@@ -41,6 +41,8 @@ func main() {
 		"Print thermal resistance (°C/W) and R², then exit without rendering a chart")
 	dailyResistance := flag.Bool("daily-resistance", false,
 		"Plot daily thermal resistance (°C/W) over time (your ADHD coping tool)")
+	minSamples := flag.Int("min-samples", 25000,
+		"Minimum raw samples per day to include in the R_th line (--daily-resistance)")
 	output := flag.String("output", "",
 		"Save PNG to file instead of terminal display")
 	flag.Parse()
@@ -101,7 +103,7 @@ func main() {
 			if label == "" {
 				label = "all"
 			}
-			rth, count, ticks := buildDailyResistanceSeries(pts, label, colorIdx)
+			rth, count, ticks := buildDailyResistanceSeries(pts, label, colorIdx, *minSamples)
 			if rth != nil {
 				seriesList = append(seriesList, rth, count)
 				// Use the ticks from the first series; they share the same x positions.
@@ -566,13 +568,14 @@ func buildBinnedLine(pts []point, binSize float64, name string, colorIdx int) ch
 }
 
 // buildDailyResistanceSeries groups pts by local calendar day, applies a
-// rolling average within each day to filter thermal mass transients, runs OLS
-// regression, and returns two series: R_th on the primary Y axis and sample
-// count on the secondary Y axis.
-// Days with fewer than 120 samples after smoothing or negative R² are skipped.
+// rolling average within each day to filter thermal mass transients, and
+// returns:
+//   - rthSeries: line+dots on primary Y for days with >= minSamples raw samples
+//   - countSeries: dots-only on secondary Y for ALL days (shows excluded days too)
+//   - ticks: one tick per day across all days
 const dailyRollingWindow = 2400.0
 
-func buildDailyResistanceSeries(pts []point, name string, colorIdx int) (rthSeries, countSeries chartdraw.Series, ticks []chartdraw.Tick) {
+func buildDailyResistanceSeries(pts []point, name string, colorIdx, minSamples int) (rthSeries, countSeries chartdraw.Series, ticks []chartdraw.Tick) {
 	if len(pts) == 0 {
 		return nil, nil, nil
 	}
@@ -587,11 +590,27 @@ func buildDailyResistanceSeries(pts []point, name string, colorIdx int) (rthSeri
 		byDay[day] = append(byDay[day], p)
 	}
 
-	xv := []float64{}
-	yv := []float64{}
-	cv := []float64{} // sample counts (secondary axis)
+	// Separate X/Y for R_th line (qualifying days) and count dots (all days).
+	var rthX, rthY []float64
+	var cntX, cntY []float64
+
 	for _, day := range dayOrder {
-		dayPts := applyRollingAvg(byDay[day], dailyRollingWindow)
+		rawPts := byDay[day]
+		t, _ := time.ParseInLocation("2006-01-02", day, time.Local)
+		x := float64(t.Unix())
+		rawN := len(rawPts)
+
+		// Count dot for every day regardless of qualification.
+		cntX = append(cntX, x)
+		cntY = append(cntY, float64(rawN))
+		ticks = append(ticks, chartdraw.Tick{Value: x, Label: day})
+
+		if rawN < minSamples {
+			log.Printf("INFO daily-resistance: %s skipped (%d raw samples < min %d)", day, rawN, minSamples)
+			continue
+		}
+
+		dayPts := applyRollingAvg(rawPts, dailyRollingWindow)
 		if len(dayPts) < 120 {
 			log.Printf("INFO daily-resistance: %s skipped (%d samples after rolling avg)", day, len(dayPts))
 			continue
@@ -601,52 +620,44 @@ func buildDailyResistanceSeries(pts []point, name string, colorIdx int) (rthSeri
 			log.Printf("INFO daily-resistance: %s skipped (R²=%.3f)", day, r2)
 			continue
 		}
-		t, _ := time.ParseInLocation("2006-01-02", day, time.Local)
-		log.Printf("INFO daily-resistance: %s  R_th=%.3f °C/W  R²=%.3f  n=%d", day, slope, r2, len(dayPts))
-		xv = append(xv, float64(t.Unix()))
-		yv = append(yv, slope)
-		cv = append(cv, float64(len(dayPts)))
+		log.Printf("INFO daily-resistance: %s  R_th=%.3f °C/W  R²=%.3f  n_raw=%d  n_smooth=%d", day, slope, r2, rawN, len(dayPts))
+		rthX = append(rthX, x)
+		rthY = append(rthY, slope)
 	}
 
-	if len(xv) < 2 {
-		log.Printf("WARN daily-resistance %s: only %d day(s) with enough data", name, len(xv))
+	if len(cntX) == 0 {
 		return nil, nil, nil
 	}
 
-	// Build explicit ticks at exact midnight for each included day so the
-	// chart renderer places labels precisely on the data points.
-	for _, x := range xv {
-		ts := int64(x)
-		label := time.Unix(ts, 0).Local().Format("2006-01-02")
-		ticks = append(ticks, chartdraw.Tick{Value: x, Label: label})
+	// Count dots — no stroke, just dots; covers all days including excluded.
+	countColor := chartdraw.ColorAlternateGray
+	countSeries = chartdraw.ContinuousSeries{
+		Name:    name + " samples",
+		XValues: cntX,
+		YValues: cntY,
+		YAxis:   chartdraw.YAxisSecondary,
+		Style: chartdraw.Style{
+			StrokeWidth: float64(chartdraw.Disabled),
+			DotColor:    countColor,
+			DotWidth:    5,
+		},
+	}
+
+	if len(rthX) < 2 {
+		log.Printf("WARN daily-resistance %s: only %d qualifying day(s) for R_th line", name, len(rthX))
+		return nil, countSeries, ticks
 	}
 
 	c := chartdraw.GetDefaultColor(colorIdx)
 	rthSeries = chartdraw.ContinuousSeries{
 		Name:    name + " R_th",
-		XValues: xv,
-		YValues: yv,
+		XValues: rthX,
+		YValues: rthY,
 		Style: chartdraw.Style{
 			StrokeColor: c,
 			StrokeWidth: 2,
 			DotColor:    c,
 			DotWidth:    5,
-		},
-	}
-
-	// Sample count on secondary axis, dimmed so it doesn't dominate visually.
-	countColor := chartdraw.ColorAlternateGray
-	countSeries = chartdraw.ContinuousSeries{
-		Name:    name + " samples",
-		XValues: xv,
-		YValues: cv,
-		YAxis:   chartdraw.YAxisSecondary,
-		Style: chartdraw.Style{
-			StrokeColor: countColor,
-			StrokeWidth: 1,
-			StrokeDashArray: []float64{4, 4},
-			DotColor:    countColor,
-			DotWidth:    3,
 		},
 	}
 	return rthSeries, countSeries, ticks
