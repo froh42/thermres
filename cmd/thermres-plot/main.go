@@ -116,6 +116,25 @@ func main() {
 		if len(seriesList) == 0 {
 			log.Fatalf("no daily data to plot")
 		}
+
+		// Scan all series to find max values for each axis so we can set
+		// Range{Min:0, Max:realMax} — chartdraw ignores Range when Max==0.
+		var maxRth, maxCount float64
+		for _, s := range seriesList {
+			cs := s.(chartdraw.ContinuousSeries)
+			for _, v := range cs.YValues {
+				if cs.YAxis == chartdraw.YAxisSecondary {
+					if v > maxCount {
+						maxCount = v
+					}
+				} else {
+					if v > maxRth {
+						maxRth = v
+					}
+				}
+			}
+		}
+
 		graph := chartdraw.Chart{
 			Title:  "Daily Thermal Resistance",
 			Width:  800,
@@ -129,11 +148,11 @@ func main() {
 			},
 			YAxis: chartdraw.YAxis{
 				Name:  "Thermal Resistance (°C/W)",
-				Range: &chartdraw.ContinuousRange{Min: 0},
+				Range: &chartdraw.ContinuousRange{Min: 0, Max: maxRth * 1.1},
 			},
 			YAxisSecondary: chartdraw.YAxis{
 				Name:  "Samples per day",
-				Range: &chartdraw.ContinuousRange{Min: 0},
+				Range: &chartdraw.ContinuousRange{Min: 0, Max: maxCount * 1.1},
 			},
 			Background: chartdraw.Style{Padding: chartdraw.NewBox(20, 30, 20, 30)},
 			Series:     seriesList,
